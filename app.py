@@ -1,797 +1,731 @@
+# app.py
 """
-Chat with PDF - Advanced AI-Powered PDF Question Answering Application
-Author: AI Assistant
-Description: A comprehensive Streamlit application for uploading, processing, and chatting with PDF documents
-using advanced NLP, vector embeddings, and LLM integration.
+Chat with PDF Application
+A comprehensive local PDF chatbot using open-source libraries
+Supports multiple PDFs, embeddings, vector search, Q&A, and advanced features
 """
 
 import streamlit as st
-import fitz  # PyMuPDF
-import pdfplumber
 import os
-import sqlite3
-import bcrypt
+import io
 import json
-import logging
-from datetime import datetime
-from typing import List, Dict, Tuple, Optional
-import pandas as pd
-import numpy as np
-from io import BytesIO
-import base64
 import time
+import hashlib
 import re
+from datetime import datetime
+from typing import List, Dict, Tuple, Optional, Any
+from pathlib import Path
+import numpy as np
 
-# AI/NLP Libraries
+# PDF Processing
+try:
+    from PyPDF2 import PdfReader
+except ImportError:
+    PdfReader = None
+
+# OCR Support
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# NLP and Embeddings
 from sentence_transformers import SentenceTransformer
 import faiss
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
-from langchain_openai import ChatOpenAI
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.vectorstores import FAISS as LangchainFAISS
-from langchain.embeddings import HuggingFaceEmbeddings
+
+# Transformers for Q&A
+from transformers import pipeline, AutoTokenizer, AutoModelForQuestionAnswering
+from transformers import AutoModelForSeq2SeqLM
+
+# Text Processing
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
 import spacy
 
-# Environment variables
-from dotenv import load_dotenv
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('app.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Constants
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-MAX_REQUESTS_PER_MINUTE = 30
-DB_PATH = "chat_pdf.db"
-
-# Initialize spaCy model for NER (download with: python -m spacy download en_core_web_sm)
-try:
-    nlp = spacy.load("en_core_web_sm")
-except:
-    logger.warning("spaCy model not found. Entity recognition will be disabled.")
-    nlp = None
+# Additional utilities
+import pandas as pd
+import pickle
 
 
-# ==================== DATABASE SETUP ====================
-def init_database():
-    """Initialize SQLite database for user management and chat history."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Users table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Chat history table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            session_id TEXT,
-            pdf_name TEXT,
-            message_type TEXT,
-            message TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Usage analytics table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS usage_analytics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT,
-            details TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized successfully")
+# Download required NLTK data
+@st.cache_resource
+def download_nltk_data():
+    """Download required NLTK data packages"""
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+    try:
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        nltk.download('stopwords', quiet=True)
+    try:
+        nltk.data.find('tokenizers/punkt_tab')
+    except LookupError:
+        nltk.download('punkt_tab', quiet=True)
 
 
-# ==================== USER AUTHENTICATION ====================
-class UserAuth:
-    """Handle user authentication and session management."""
-    
-    @staticmethod
-    def hash_password(password: str) -> str:
-        """Hash a password using bcrypt."""
-        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    
-    @staticmethod
-    def verify_password(password: str, password_hash: str) -> bool:
-        """Verify a password against its hash."""
-        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
-    
-    @staticmethod
-    def register_user(username: str, password: str) -> Tuple[bool, str]:
-        """Register a new user."""
-        if len(username) < 3 or len(password) < 6:
-            return False, "Username must be 3+ chars, password 6+ chars"
-        
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            password_hash = UserAuth.hash_password(password)
-            cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", 
-                         (username, password_hash))
-            conn.commit()
-            user_id = cursor.lastrowid
-            conn.close()
-            logger.info(f"User registered: {username}")
-            return True, f"User {username} registered successfully!"
-        except sqlite3.IntegrityError:
-            return False, "Username already exists"
-        except Exception as e:
-            logger.error(f"Registration error: {e}")
-            return False, f"Registration failed: {str(e)}"
-    
-    @staticmethod
-    def login_user(username: str, password: str) -> Tuple[bool, Optional[int], str]:
-        """Authenticate a user."""
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
-            result = cursor.fetchone()
-            conn.close()
-            
-            if result and UserAuth.verify_password(password, result[1]):
-                logger.info(f"User logged in: {username}")
-                return True, result[0], "Login successful!"
-            return False, None, "Invalid username or password"
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            return False, None, f"Login failed: {str(e)}"
+# Initialize NLTK
+download_nltk_data()
 
 
-# ==================== PDF PROCESSING ====================
+# Load spaCy model
+@st.cache_resource
+def load_spacy_model():
+    """Load spaCy model for NER and advanced processing"""
+    try:
+        return spacy.load("en_core_web_sm")
+    except OSError:
+        st.warning("spaCy model not found. Run: python -m spacy download en_core_web_sm")
+        return None
+
+
 class PDFProcessor:
-    """Handle PDF upload, extraction, and processing."""
+    """Handles PDF text extraction and preprocessing"""
     
-    @staticmethod
-    def validate_pdf(file) -> Tuple[bool, str]:
-        """Validate uploaded PDF file."""
-        if file.size > MAX_FILE_SIZE:
-            return False, f"File too large. Max size: {MAX_FILE_SIZE // (1024*1024)}MB"
+    def __init__(self, use_ocr: bool = False):
+        self.use_ocr = use_ocr and OCR_AVAILABLE
         
-        if not file.name.lower().endswith('.pdf'):
-            return False, "Only PDF files are supported"
-        
-        return True, "Valid PDF"
-    
-    @staticmethod
-    def extract_text_pymupdf(pdf_bytes: bytes) -> str:
-        """Extract text from PDF using PyMuPDF."""
+    def extract_text_from_pdf(self, pdf_file) -> Dict[str, Any]:
+        """Extract text from PDF file with metadata"""
         try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            text = ""
-            for page in doc:
-                text += page.get_text()
-            doc.close()
-            return text
-        except Exception as e:
-            logger.error(f"PyMuPDF extraction error: {e}")
-            return ""
-    
-    @staticmethod
-    def extract_text_pdfplumber(pdf_bytes: bytes) -> str:
-        """Extract text from PDF using pdfplumber (fallback)."""
-        try:
-            with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-                text = ""
-                for page in pdf.pages:
-                    text += page.extract_text() or ""
-            return text
-        except Exception as e:
-            logger.error(f"pdfplumber extraction error: {e}")
-            return ""
-    
-    @staticmethod
-    def extract_text(pdf_bytes: bytes) -> str:
-        """Extract text using primary and fallback methods."""
-        text = PDFProcessor.extract_text_pymupdf(pdf_bytes)
-        if not text.strip():
-            logger.warning("PyMuPDF failed, trying pdfplumber")
-            text = PDFProcessor.extract_text_pdfplumber(pdf_bytes)
-        return text
-    
-    @staticmethod
-    def extract_entities(text: str) -> Dict[str, List[str]]:
-        """Extract named entities using spaCy."""
-        if not nlp or not text:
-            return {}
-        
-        try:
-            doc = nlp(text[:100000])  # Limit for performance
-            entities = {}
-            for ent in doc.ents:
-                if ent.label_ not in entities:
-                    entities[ent.label_] = []
-                if ent.text not in entities[ent.label_]:
-                    entities[ent.label_].append(ent.text)
-            return entities
-        except Exception as e:
-            logger.error(f"Entity extraction error: {e}")
-            return {}
-    
-    @staticmethod
-    def extract_keywords(text: str, top_n: int = 10) -> List[str]:
-        """Extract keywords using simple frequency analysis."""
-        if not text:
-            return []
-        
-        # Simple keyword extraction (frequency-based)
-        words = re.findall(r'\b[a-z]{4,}\b', text.lower())
-        stop_words = {'that', 'this', 'with', 'from', 'have', 'been', 'were', 'their', 'which'}
-        words = [w for w in words if w not in stop_words]
-        
-        word_freq = {}
-        for word in words:
-            word_freq[word] = word_freq.get(word, 0) + 1
-        
-        sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
-        return [word for word, freq in sorted_words[:top_n]]
-
-
-# ==================== VECTOR STORE & EMBEDDINGS ====================
-class VectorStoreManager:
-    """Manage vector embeddings and semantic search."""
-    
-    def __init__(self):
-        self.embedding_model = None
-        self.vectorstore = None
-        self.documents = []
-    
-    def initialize_embeddings(self):
-        """Initialize sentence transformer model."""
-        if not self.embedding_model:
-            with st.spinner("Loading embedding model..."):
-                self.embedding_model = HuggingFaceEmbeddings(
-                    model_name="sentence-transformers/all-MiniLM-L6-v2"
-                )
-                logger.info("Embedding model loaded")
-    
-    def create_vectorstore(self, text: str, pdf_name: str) -> bool:
-        """Create vector store from PDF text."""
-        try:
-            self.initialize_embeddings()
+            pdf_reader = PdfReader(pdf_file)
             
-            # Split text into chunks
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=CHUNK_SIZE,
-                chunk_overlap=CHUNK_OVERLAP,
-                length_function=len
-            )
+            metadata = {
+                'num_pages': len(pdf_reader.pages),
+                'title': pdf_reader.metadata.get('/Title', 'Unknown') if pdf_reader.metadata else 'Unknown',
+                'author': pdf_reader.metadata.get('/Author', 'Unknown') if pdf_reader.metadata else 'Unknown',
+                'subject': pdf_reader.metadata.get('/Subject', '') if pdf_reader.metadata else '',
+                'creator': pdf_reader.metadata.get('/Creator', '') if pdf_reader.metadata else '',
+            }
             
-            chunks = text_splitter.split_text(text)
-            self.documents = [
-                Document(page_content=chunk, metadata={"source": pdf_name, "chunk": i})
-                for i, chunk in enumerate(chunks)
-            ]
-            
-            # Create FAISS vectorstore
-            self.vectorstore = LangchainFAISS.from_documents(
-                self.documents,
-                self.embedding_model
-            )
-            
-            logger.info(f"Vector store created with {len(chunks)} chunks")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Vector store creation error: {e}")
-            st.error(f"Failed to create vector store: {str(e)}")
-            return False
-    
-    def similarity_search(self, query: str, k: int = 3) -> List[Document]:
-        """Perform similarity search."""
-        if not self.vectorstore:
-            return []
-        
-        try:
-            results = self.vectorstore.similarity_search(query, k=k)
-            return results
-        except Exception as e:
-            logger.error(f"Similarity search error: {e}")
-            return []
-
-
-# ==================== LLM & CHAT ====================
-class ChatManager:
-    """Manage chat interactions with LLM."""
-    
-    def __init__(self, vectorstore_manager: VectorStoreManager):
-        self.vectorstore_manager = vectorstore_manager
-        self.llm = None
-        self.qa_chain = None
-        self.memory = None
-    
-    def initialize_llm(self, temperature: float = 0.7, model: str = "gpt-3.5-turbo"):
-        """Initialize OpenAI LLM."""
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            st.error("OpenAI API key not found. Please set OPENAI_API_KEY environment variable.")
-            return False
-        
-        try:
-            self.llm = ChatOpenAI(
-                model_name=model,
-                temperature=temperature,
-                openai_api_key=api_key
-            )
-            
-            self.memory = ConversationBufferMemory(
-                memory_key="chat_history",
-                return_messages=True,
-                output_key="answer"
-            )
-            
-            if self.vectorstore_manager.vectorstore:
-                self.qa_chain = ConversationalRetrievalChain.from_llm(
-                    llm=self.llm,
-                    retriever=self.vectorstore_manager.vectorstore.as_retriever(search_kwargs={"k": 3}),
-                    memory=self.memory,
-                    return_source_documents=True
-                )
-            
-            logger.info("LLM initialized successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"LLM initialization error: {e}")
-            st.error(f"Failed to initialize LLM: {str(e)}")
-            return False
-    
-    def get_response(self, question: str) -> Tuple[str, List[Document]]:
-        """Get response from LLM based on question."""
-        if not self.qa_chain:
-            return "Please upload a PDF and initialize the chat first.", []
-        
-        try:
-            result = self.qa_chain({"question": question})
-            answer = result.get("answer", "No answer generated.")
-            source_docs = result.get("source_documents", [])
-            return answer, source_docs
-            
-        except Exception as e:
-            logger.error(f"Chat response error: {e}")
-            return f"Error generating response: {str(e)}", []
-    
-    def generate_summary(self, text: str, max_length: int = 500) -> str:
-        """Generate summary of PDF content."""
-        if not self.llm:
-            return "LLM not initialized"
-        
-        try:
-            # Truncate text if too long
-            truncated_text = text[:4000]
-            
-            prompt = f"""Please provide a concise summary of the following text in about {max_length} characters:
-
-{truncated_text}
-
-Summary:"""
-            
-            response = self.llm.predict(prompt)
-            return response
-            
-        except Exception as e:
-            logger.error(f"Summary generation error: {e}")
-            return f"Error generating summary: {str(e)}"
-
-
-# ==================== DATABASE HELPERS ====================
-def save_chat_message(user_id: int, session_id: str, pdf_name: str, 
-                     message_type: str, message: str):
-    """Save chat message to database."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO chat_history (user_id, session_id, pdf_name, message_type, message) VALUES (?, ?, ?, ?, ?)",
-            (user_id, session_id, pdf_name, message_type, message)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Error saving chat message: {e}")
-
-
-def log_usage(user_id: int, action: str, details: str = ""):
-    """Log user actions for analytics."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO usage_analytics (user_id, action, details) VALUES (?, ?, ?)",
-            (user_id, action, details)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Error logging usage: {e}")
-
-
-def get_chat_history(user_id: int, session_id: str) -> List[Dict]:
-    """Retrieve chat history for a session."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT message_type, message, timestamp FROM chat_history WHERE user_id = ? AND session_id = ? ORDER BY timestamp",
-            (user_id, session_id)
-        )
-        results = cursor.fetchall()
-        conn.close()
-        
-        return [{"type": r[0], "message": r[1], "timestamp": r[2]} for r in results]
-    except Exception as e:
-        logger.error(f"Error retrieving chat history: {e}")
-        return []
-
-
-# ==================== RATE LIMITING ====================
-class RateLimiter:
-    """Simple rate limiter to prevent abuse."""
-    
-    def __init__(self):
-        if 'rate_limit_data' not in st.session_state:
-            st.session_state.rate_limit_data = {}
-    
-    def check_limit(self, user_id: int, max_requests: int = MAX_REQUESTS_PER_MINUTE) -> bool:
-        """Check if user has exceeded rate limit."""
-        current_time = time.time()
-        
-        if user_id not in st.session_state.rate_limit_data:
-            st.session_state.rate_limit_data[user_id] = []
-        
-        # Remove old requests (older than 1 minute)
-        st.session_state.rate_limit_data[user_id] = [
-            t for t in st.session_state.rate_limit_data[user_id]
-            if current_time - t < 60
-        ]
-        
-        if len(st.session_state.rate_limit_data[user_id]) >= max_requests:
-            return False
-        
-        st.session_state.rate_limit_data[user_id].append(current_time)
-        return True
-
-
-# ==================== UI COMPONENTS ====================
-def render_login_page():
-    """Render login/signup page."""
-    st.title("🔐 Chat with PDF - Login")
-    
-    tab1, tab2 = st.tabs(["Login", "Sign Up"])
-    
-    with tab1:
-        st.subheader("Login to Your Account")
-        username = st.text_input("Username", key="login_username")
-        password = st.text_input("Password", type="password", key="login_password")
-        
-        if st.button("Login", key="login_btn"):
-            if username and password:
-                success, user_id, message = UserAuth.login_user(username, password)
-                if success:
-                    st.session_state.authenticated = True
-                    st.session_state.user_id = user_id
-                    st.session_state.username = username
-                    st.success(message)
-                    st.rerun()
-                else:
-                    st.error(message)
-            else:
-                st.warning("Please enter both username and password")
-    
-    with tab2:
-        st.subheader("Create New Account")
-        new_username = st.text_input("Username", key="signup_username")
-        new_password = st.text_input("Password", type="password", key="signup_password")
-        confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm")
-        
-        if st.button("Sign Up", key="signup_btn"):
-            if new_username and new_password and confirm_password:
-                if new_password != confirm_password:
-                    st.error("Passwords do not match")
-                else:
-                    success, message = UserAuth.register_user(new_username, new_password)
-                    if success:
-                        st.success(message)
-                    else:
-                        st.error(message)
-            else:
-                st.warning("Please fill all fields")
-
-
-def render_sidebar():
-    """Render sidebar with settings and controls."""
-    st.sidebar.title("⚙️ Settings")
-    
-    # User info
-    st.sidebar.info(f"👤 Logged in as: **{st.session_state.username}**")
-    
-    if st.sidebar.button("🚪 Logout"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
-    
-    st.sidebar.markdown("---")
-    
-    # AI Parameters
-    st.sidebar.subheader("🤖 AI Parameters")
-    temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.7, 0.1,
-                                   help="Higher = more creative, Lower = more focused")
-    model_choice = st.sidebar.selectbox("Model", ["gpt-3.5-turbo", "gpt-4"],
-                                       help="Select OpenAI model")
-    
-    st.sidebar.markdown("---")
-    
-    # App Info
-    st.sidebar.subheader("ℹ️ About")
-    st.sidebar.info(
-        "This app allows you to upload PDFs and chat with them using AI. "
-        "Upload a PDF, ask questions, and get intelligent answers based on the content."
-    )
-    
-    return temperature, model_choice
-
-
-def export_chat_history(chat_messages: List[Dict]) -> str:
-    """Export chat history as text."""
-    export_text = "Chat History Export\n"
-    export_text += "=" * 50 + "\n\n"
-    
-    for msg in chat_messages:
-        timestamp = msg.get('timestamp', 'N/A')
-        msg_type = msg['type'].upper()
-        message = msg['message']
-        export_text += f"[{timestamp}] {msg_type}:\n{message}\n\n"
-    
-    return export_text
-
-
-def render_main_app():
-    """Render main application interface."""
-    st.title("📄 Chat with PDF")
-    st.markdown("Upload your PDF and start asking questions!")
-    
-    # Sidebar
-    temperature, model_choice = render_sidebar()
-    
-    # Initialize session state
-    if 'vector_manager' not in st.session_state:
-        st.session_state.vector_manager = VectorStoreManager()
-    
-    if 'chat_manager' not in st.session_state:
-        st.session_state.chat_manager = ChatManager(st.session_state.vector_manager)
-    
-    if 'chat_messages' not in st.session_state:
-        st.session_state.chat_messages = []
-    
-    if 'session_id' not in st.session_state:
-        st.session_state.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    if 'pdf_processed' not in st.session_state:
-        st.session_state.pdf_processed = False
-    
-    if 'current_pdf_name' not in st.session_state:
-        st.session_state.current_pdf_name = None
-    
-    if 'pdf_text' not in st.session_state:
-        st.session_state.pdf_text = ""
-    
-    if 'rate_limiter' not in st.session_state:
-        st.session_state.rate_limiter = RateLimiter()
-    
-    # File upload section
-    st.subheader("📤 Upload PDF")
-    uploaded_file = st.file_uploader("Choose a PDF file", type=['pdf'])
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        process_btn = st.button("🔄 Process PDF", disabled=uploaded_file is None)
-    
-    with col2:
-        if st.session_state.pdf_processed:
-            summary_btn = st.button("📝 Generate Summary")
-        else:
-            summary_btn = False
-    
-    with col3:
-        if st.session_state.pdf_processed:
-            analyze_btn = st.button("🔍 Analyze Content")
-        else:
-            analyze_btn = False
-    
-    # Process PDF
-    if process_btn and uploaded_file:
-        # Validate PDF
-        is_valid, message = PDFProcessor.validate_pdf(uploaded_file)
-        if not is_valid:
-            st.error(message)
-        else:
-            with st.spinner("Processing PDF..."):
-                try:
-                    # Extract text
-                    pdf_bytes = uploaded_file.read()
-                    text = PDFProcessor.extract_text(pdf_bytes)
-                    
-                    if not text.strip():
-                        st.error("Could not extract text from PDF. The file may be image-based or corrupted.")
-                    else:
-                        st.session_state.pdf_text = text
-                        st.session_state.current_pdf_name = uploaded_file.name
-                        
-                        # Create vector store
-                        success = st.session_state.vector_manager.create_vectorstore(
-                            text, uploaded_file.name
-                        )
-                        
-                        if success:
-                            # Initialize LLM
-                            llm_success = st.session_state.chat_manager.initialize_llm(
-                                temperature=temperature,
-                                model=model_choice
-                            )
-                            
-                            if llm_success:
-                                st.session_state.pdf_processed = True
-                                st.success(f"✅ PDF processed successfully! ({len(text)} characters extracted)")
-                                log_usage(st.session_state.user_id, "pdf_upload", uploaded_file.name)
-                            else:
-                                st.error("Failed to initialize LLM. Check your API key.")
-                        else:
-                            st.error("Failed to create vector store.")
+            pages_text = []
+            for page_num, page in enumerate(pdf_reader.pages):
+                text = page.extract_text()
                 
-                except Exception as e:
-                    logger.error(f"PDF processing error: {e}")
-                    st.error(f"Error processing PDF: {str(e)}")
-    
-    # Generate Summary
-    if summary_btn:
-        with st.spinner("Generating summary..."):
-            summary = st.session_state.chat_manager.generate_summary(st.session_state.pdf_text)
-            st.subheader("📝 Document Summary")
-            st.info(summary)
-            log_usage(st.session_state.user_id, "generate_summary", st.session_state.current_pdf_name)
-    
-    # Analyze Content
-    if analyze_btn:
-        with st.spinner("Analyzing content..."):
-            col_a, col_b = st.columns(2)
+                # Try OCR if text extraction fails and OCR is enabled
+                if (not text or len(text.strip()) < 50) and self.use_ocr:
+                    text = self._ocr_page(pdf_file, page_num)
+                
+                pages_text.append({
+                    'page_num': page_num + 1,
+                    'text': text
+                })
             
-            with col_a:
-                st.subheader("🔑 Keywords")
-                keywords = PDFProcessor.extract_keywords(st.session_state.pdf_text)
-                st.write(", ".join(keywords))
-            
-            with col_b:
-                st.subheader("🏷️ Named Entities")
-                entities = PDFProcessor.extract_entities(st.session_state.pdf_text)
-                if entities:
-                    for entity_type, entity_list in list(entities.items())[:5]:
-                        st.write(f"**{entity_type}**: {', '.join(entity_list[:5])}")
-                else:
-                    st.write("Entity recognition not available")
-            
-            log_usage(st.session_state.user_id, "analyze_content", st.session_state.current_pdf_name)
+            return {
+                'metadata': metadata,
+                'pages': pages_text,
+                'full_text': '\n\n'.join([p['text'] for p in pages_text])
+            }
+        except Exception as e:
+            st.error(f"Error extracting PDF: {str(e)}")
+            return None
     
-    st.markdown("---")
+    def _ocr_page(self, pdf_file, page_num: int) -> str:
+        """OCR a specific page"""
+        try:
+            pdf_file.seek(0)
+            images = convert_from_bytes(pdf_file.read(), first_page=page_num+1, last_page=page_num+1)
+            if images:
+                text = pytesseract.image_to_string(images[0])
+                return text
+        except Exception as e:
+            st.warning(f"OCR failed for page {page_num + 1}: {str(e)}")
+        return ""
     
-    # Chat Interface
-    if st.session_state.pdf_processed:
-        st.subheader("💬 Chat with Your PDF")
+    def clean_text(self, text: str) -> str:
+        """Clean and normalize text"""
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep basic punctuation
+        text = re.sub(r'[^\w\s.,!?;:\-\(\)]', '', text)
+        return text.strip()
+    
+    def chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[Dict[str, Any]]:
+        """Split text into overlapping chunks"""
+        # Sentence-aware chunking
+        sentences = sent_tokenize(text)
         
-        # Display chat history
-        chat_container = st.container()
-        with chat_container:
-            for msg in st.session_state.chat_messages:
-                if msg['type'] == 'user':
-                    st.chat_message("user").write(msg['message'])
-                else:
-                    st.chat_message("assistant").write(msg['message'])
+        chunks = []
+        current_chunk = []
+        current_size = 0
         
-        # Chat input
-        user_question = st.chat_input("Ask a question about your PDF...")
-        
-        if user_question:
-            # Rate limiting
-            if not st.session_state.rate_limiter.check_limit(st.session_state.user_id):
-                st.error("Rate limit exceeded. Please wait a moment before asking more questions.")
-            else:
-                # Add user message
-                st.session_state.chat_messages.append({
-                    'type': 'user',
-                    'message': user_question,
-                    'timestamp': datetime.now().isoformat()
+        for sentence in sentences:
+            sentence_words = word_tokenize(sentence)
+            sentence_size = len(sentence_words)
+            
+            if current_size + sentence_size > chunk_size and current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunks.append({
+                    'text': chunk_text,
+                    'size': current_size
                 })
                 
-                # Save to database
-                save_chat_message(
-                    st.session_state.user_id,
-                    st.session_state.session_id,
-                    st.session_state.current_pdf_name,
-                    'user',
-                    user_question
-                )
+                # Keep last few sentences for overlap
+                overlap_sentences = []
+                overlap_size = 0
+                for sent in reversed(current_chunk[-3:]):
+                    overlap_size += len(word_tokenize(sent))
+                    overlap_sentences.insert(0, sent)
+                    if overlap_size >= overlap:
+                        break
                 
-                # Get AI response
-                with st.spinner("Thinking..."):
-                    answer, source_docs = st.session_state.chat_manager.get_response(user_question)
-                    
-                    # Add assistant message
-                    st.session_state.chat_messages.append({
-                        'type': 'assistant',
-                        'message': answer,
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    # Save to database
-                    save_chat_message(
-                        st.session_state.user_id,
-                        st.session_state.session_id,
-                        st.session_state.current_pdf_name,
-                        'assistant',
-                        answer
-                    )
-                    
-                    log_usage(st.session_state.user_id, "chat_query", user_question)
-                
-                st.rerun()
+                current_chunk = overlap_sentences
+                current_size = overlap_size
+            
+            current_chunk.append(sentence)
+            current_size += sentence_size
+        
+        # Add remaining chunk
+        if current_chunk:
+            chunks.append({
+                'text': ' '.join(current_chunk),
+                'size': current_size
+            })
+        
+        return chunks
+
+
+class EmbeddingManager:
+    """Manages embeddings and vector database"""
+    
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model = self._load_embedding_model(model_name)
+        self.index = None
+        self.chunks = []
+        self.chunk_metadata = []
+        
+    @st.cache_resource
+    def _load_embedding_model(_self, model_name: str):
+        """Load sentence transformer model"""
+        return SentenceTransformer(model_name)
+    
+    def create_embeddings(self, chunks: List[Dict[str, Any]], pdf_name: str, progress_callback=None):
+        """Create embeddings for text chunks"""
+        texts = [chunk['text'] for chunk in chunks]
+        
+        embeddings = []
+        batch_size = 32
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_embeddings = self.model.encode(batch, show_progress_bar=False)
+            embeddings.extend(batch_embeddings)
+            
+            if progress_callback:
+                progress_callback((i + len(batch)) / len(texts))
+        
+        embeddings = np.array(embeddings).astype('float32')
+        
+        # Store chunks with metadata
+        for i, chunk in enumerate(chunks):
+            self.chunks.append(chunk['text'])
+            self.chunk_metadata.append({
+                'pdf_name': pdf_name,
+                'chunk_index': i,
+                'size': chunk['size']
+            })
+        
+        # Build or update FAISS index
+        if self.index is None:
+            self.index = faiss.IndexFlatL2(embeddings.shape[1])
+        
+        self.index.add(embeddings)
+        
+        return embeddings
+    
+    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for relevant chunks"""
+        if self.index is None or len(self.chunks) == 0:
+            return []
+        
+        query_embedding = self.model.encode([query]).astype('float32')
+        distances, indices = self.index.search(query_embedding, min(top_k, len(self.chunks)))
+        
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx < len(self.chunks):
+                results.append({
+                    'text': self.chunks[idx],
+                    'metadata': self.chunk_metadata[idx],
+                    'score': float(dist)
+                })
+        
+        return results
+    
+    def clear(self):
+        """Clear all embeddings and index"""
+        self.index = None
+        self.chunks = []
+        self.chunk_metadata = []
+
+
+class QuestionAnsweringEngine:
+    """Handles question answering using local models"""
+    
+    def __init__(self, model_name: str = "distilbert-base-cased-distilled-squad"):
+        self.qa_pipeline = self._load_qa_model(model_name)
+        self.summarization_pipeline = self._load_summarization_model()
+        self.nlp = load_spacy_model()
+        
+    @st.cache_resource
+    def _load_qa_model(_self, model_name: str):
+        """Load question answering model"""
+        try:
+            return pipeline("question-answering", model=model_name, tokenizer=model_name)
+        except Exception as e:
+            st.error(f"Error loading Q&A model: {str(e)}")
+            return None
+    
+    @st.cache_resource
+    def _load_summarization_model(_self):
+        """Load summarization model"""
+        try:
+            return pipeline("summarization", model="sshleifer/distilbart-cnn-6-6")
+        except Exception as e:
+            st.warning(f"Summarization model not available: {str(e)}")
+            return None
+    
+    def answer_question(self, question: str, context_chunks: List[Dict[str, Any]], max_context_length: int = 2000) -> Dict[str, Any]:
+        """Generate answer from context chunks"""
+        if not self.qa_pipeline:
+            return {
+                'answer': "Q&A model not available",
+                'confidence': 0.0,
+                'source_chunk': None
+            }
+        
+        # Combine top chunks as context
+        context = ' '.join([chunk['text'] for chunk in context_chunks[:3]])
+        
+        # Truncate context if too long
+        if len(context) > max_context_length:
+            context = context[:max_context_length]
+        
+        try:
+            result = self.qa_pipeline(question=question, context=context)
+            
+            # Find which chunk contains the answer
+            answer_text = result['answer']
+            source_chunk = None
+            for chunk in context_chunks:
+                if answer_text.lower() in chunk['text'].lower():
+                    source_chunk = chunk
+                    break
+            
+            return {
+                'answer': result['answer'],
+                'confidence': result['score'],
+                'source_chunk': source_chunk,
+                'context': context[:500] + '...' if len(context) > 500 else context
+            }
+        except Exception as e:
+            return {
+                'answer': f"Error generating answer: {str(e)}",
+                'confidence': 0.0,
+                'source_chunk': None
+            }
+    
+    def summarize_text(self, text: str, max_length: int = 150, min_length: int = 50) -> str:
+        """Summarize text"""
+        if not self.summarization_pipeline:
+            # Fallback: return first few sentences
+            sentences = sent_tokenize(text)
+            return ' '.join(sentences[:3])
+        
+        try:
+            # Truncate input if too long
+            max_input = 1024
+            if len(text) > max_input:
+                text = text[:max_input]
+            
+            summary = self.summarization_pipeline(text, max_length=max_length, min_length=min_length, do_sample=False)
+            return summary[0]['summary_text']
+        except Exception as e:
+            sentences = sent_tokenize(text)
+            return ' '.join(sentences[:3])
+    
+    def extract_entities(self, text: str) -> List[Dict[str, str]]:
+        """Extract named entities from text"""
+        if not self.nlp:
+            return []
+        
+        doc = self.nlp(text[:1000000])  # Limit text size
+        entities = []
+        
+        for ent in doc.ents:
+            entities.append({
+                'text': ent.text,
+                'label': ent.label_,
+                'start': ent.start_char,
+                'end': ent.end_char
+            })
+        
+        return entities
+    
+    def analyze_sentiment(self, text: str) -> str:
+        """Basic sentiment analysis"""
+        # Simple keyword-based sentiment
+        positive_words = {'good', 'great', 'excellent', 'positive', 'benefit', 'advantage', 'success'}
+        negative_words = {'bad', 'poor', 'negative', 'problem', 'issue', 'fail', 'disadvantage'}
+        
+        words = set(word_tokenize(text.lower()))
+        
+        pos_count = len(words & positive_words)
+        neg_count = len(words & negative_words)
+        
+        if pos_count > neg_count:
+            return "Positive"
+        elif neg_count > pos_count:
+            return "Negative"
+        else:
+            return "Neutral"
+
+
+class ChatManager:
+    """Manages chat history and context"""
+    
+    def __init__(self):
+        self.history = []
+        
+    def add_message(self, role: str, content: str, metadata: Optional[Dict] = None):
+        """Add message to chat history"""
+        self.history.append({
+            'role': role,
+            'content': content,
+            'metadata': metadata or {},
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    def get_history(self, last_n: int = None) -> List[Dict]:
+        """Get chat history"""
+        if last_n:
+            return self.history[-last_n:]
+        return self.history
+    
+    def clear_history(self):
+        """Clear chat history"""
+        self.history = []
+    
+    def export_history(self) -> str:
+        """Export chat history as JSON"""
+        return json.dumps(self.history, indent=2)
+    
+    def get_context_for_query(self, query: str, last_n: int = 3) -> str:
+        """Build context from recent chat history"""
+        recent = self.get_history(last_n * 2)
+        context_parts = []
+        
+        for msg in recent:
+            if msg['role'] == 'user':
+                context_parts.append(f"Question: {msg['content']}")
+            elif msg['role'] == 'assistant':
+                context_parts.append(f"Answer: {msg['content'][:200]}")
+        
+        return '\n'.join(context_parts)
+
+
+def initialize_session_state():
+    """Initialize Streamlit session state"""
+    if 'pdf_processor' not in st.session_state:
+        st.session_state.pdf_processor = PDFProcessor()
+    
+    if 'embedding_manager' not in st.session_state:
+        st.session_state.embedding_manager = EmbeddingManager()
+    
+    if 'qa_engine' not in st.session_state:
+        st.session_state.qa_engine = QuestionAnsweringEngine()
+    
+    if 'chat_manager' not in st.session_state:
+        st.session_state.chat_manager = ChatManager()
+    
+    if 'processed_pdfs' not in st.session_state:
+        st.session_state.processed_pdfs = {}
+    
+    if 'current_query' not in st.session_state:
+        st.session_state.current_query = ""
+
+
+def process_uploaded_pdfs(uploaded_files, chunk_size: int, use_ocr: bool):
+    """Process uploaded PDF files"""
+    st.session_state.pdf_processor = PDFProcessor(use_ocr=use_ocr)
+    
+    all_chunks = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, uploaded_file in enumerate(uploaded_files):
+        status_text.text(f"Processing {uploaded_file.name}...")
+        
+        # Extract text
+        pdf_data = st.session_state.pdf_processor.extract_text_from_pdf(uploaded_file)
+        
+        if pdf_data:
+            # Store PDF metadata
+            st.session_state.processed_pdfs[uploaded_file.name] = pdf_data['metadata']
+            
+            # Clean and chunk text
+            cleaned_text = st.session_state.pdf_processor.clean_text(pdf_data['full_text'])
+            chunks = st.session_state.pdf_processor.chunk_text(cleaned_text, chunk_size=chunk_size)
+            
+            # Create embeddings
+            st.session_state.embedding_manager.create_embeddings(
+                chunks, 
+                uploaded_file.name,
+                progress_callback=lambda p: progress_bar.progress((idx + p) / len(uploaded_files))
+            )
+            
+            all_chunks.extend(chunks)
+        
+        progress_bar.progress((idx + 1) / len(uploaded_files))
+    
+    status_text.text(f"✓ Processed {len(uploaded_files)} PDF(s) with {len(all_chunks)} chunks")
+    time.sleep(1)
+    status_text.empty()
+    progress_bar.empty()
+    
+    return len(all_chunks)
+
+
+def handle_query(query: str, query_type: str, top_k: int):
+    """Handle user query and generate response"""
+    # Search for relevant chunks
+    relevant_chunks = st.session_state.embedding_manager.search(query, top_k=top_k)
+    
+    if not relevant_chunks:
+        response = "No relevant information found in the uploaded PDFs."
+        st.session_state.chat_manager.add_message('assistant', response)
+        return response
+    
+    # Different handling based on query type
+    if query_type == "Direct Answer":
+        result = st.session_state.qa_engine.answer_question(query, relevant_chunks)
+        response = result['answer']
+        confidence = result['confidence']
+        
+        # Add source information
+        if result['source_chunk']:
+            source_info = f"\n\n*Source: {result['source_chunk']['metadata']['pdf_name']} (Confidence: {confidence:.2%})*"
+            response += source_info
+    
+    elif query_type == "Summary":
+        # Combine top chunks and summarize
+        combined_text = ' '.join([chunk['text'] for chunk in relevant_chunks[:3]])
+        response = st.session_state.qa_engine.summarize_text(combined_text)
+        response = f"**Summary:**\n\n{response}"
+    
+    elif query_type == "Entity Extraction":
+        # Extract entities from top chunk
+        entities = st.session_state.qa_engine.extract_entities(relevant_chunks[0]['text'])
+        if entities:
+            entity_summary = {}
+            for ent in entities:
+                if ent['label'] not in entity_summary:
+                    entity_summary[ent['label']] = []
+                if ent['text'] not in entity_summary[ent['label']]:
+                    entity_summary[ent['label']].append(ent['text'])
+            
+            response = "**Entities Found:**\n\n"
+            for label, texts in entity_summary.items():
+                response += f"**{label}:** {', '.join(texts[:5])}\n"
+        else:
+            response = "No entities found in the relevant sections."
+    
+    elif query_type == "Sentiment Analysis":
+        sentiment = st.session_state.qa_engine.analyze_sentiment(relevant_chunks[0]['text'])
+        response = f"**Sentiment Analysis:**\n\nThe relevant section appears to have a **{sentiment}** sentiment."
+    
+    else:  # Keyword Search
+        response = "**Relevant Excerpts:**\n\n"
+        for i, chunk in enumerate(relevant_chunks[:3], 1):
+            excerpt = chunk['text'][:300] + "..." if len(chunk['text']) > 300 else chunk['text']
+            response += f"{i}. {excerpt}\n\n"
+            response += f"*From: {chunk['metadata']['pdf_name']}*\n\n"
+    
+    # Store in chat history
+    st.session_state.chat_manager.add_message('assistant', response, {
+        'query_type': query_type,
+        'chunks_used': len(relevant_chunks)
+    })
+    
+    return response
+
+
+def display_pdf_metadata():
+    """Display metadata of processed PDFs"""
+    if st.session_state.processed_pdfs:
+        st.sidebar.subheader("📄 Processed PDFs")
+        
+        for pdf_name, metadata in st.session_state.processed_pdfs.items():
+            with st.sidebar.expander(pdf_name):
+                st.write(f"**Pages:** {metadata['num_pages']}")
+                if metadata['title'] != 'Unknown':
+                    st.write(f"**Title:** {metadata['title']}")
+                if metadata['author'] != 'Unknown':
+                    st.write(f"**Author:** {metadata['author']}")
+                if metadata['subject']:
+                    st.write(f"**Subject:** {metadata['subject']}")
+
+
+def export_chat_history():
+    """Export chat history to JSON file"""
+    history_json = st.session_state.chat_manager.export_history()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"chat_history_{timestamp}.json"
+    
+    st.download_button(
+        label="💾 Download Chat History",
+        data=history_json,
+        file_name=filename,
+        mime="application/json"
+    )
+
+
+def main():
+    """Main application"""
+    st.set_page_config(
+        page_title="Chat with PDF",
+        page_icon="📚",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Initialize session state
+    initialize_session_state()
+    
+    # Title and description
+    st.title("📚 Chat with PDF")
+    st.markdown("Upload PDFs and ask questions using local AI models - completely offline!")
+    
+    # Sidebar - Settings and Controls
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        
+        # PDF Upload
+        st.subheader("Upload PDFs")
+        uploaded_files = st.file_uploader(
+            "Choose PDF files",
+            type=['pdf'],
+            accept_multiple_files=True,
+            help="Upload one or more PDF files to chat with"
+        )
+        
+        # Processing options
+        chunk_size = st.slider("Chunk Size (words)", 200, 1000, 500, 50)
+        top_k_results = st.slider("Results per Query", 1, 10, 5, 1)
+        
+        use_ocr = st.checkbox("Enable OCR (slower)", value=False, help="Extract text from images in PDFs")
+        
+        # Process button
+        if uploaded_files:
+            if st.button("🔄 Process PDFs", type="primary"):
+                with st.spinner("Processing PDFs..."):
+                    num_chunks = process_uploaded_pdfs(uploaded_files, chunk_size, use_ocr)
+                    st.success(f"✅ Processed {len(uploaded_files)} PDF(s) - {num_chunks} chunks indexed")
+        
+        st.divider()
+        
+        # Query type
+        st.subheader("Query Settings")
+        query_type = st.selectbox(
+            "Query Type",
+            ["Direct Answer", "Summary", "Keyword Search", "Entity Extraction", "Sentiment Analysis"],
+            help="Choose how to process your query"
+        )
+        
+        st.divider()
+        
+        # Display PDF metadata
+        display_pdf_metadata()
+        
+        st.divider()
         
         # Chat controls
-        st.markdown("---")
-        col_c1, col_c2, col_c3 = st.columns(3)
+        st.subheader("Chat Controls")
+        col1, col2 = st.columns(2)
         
-        with col_c1:
+        with col1:
             if st.button("🗑️ Clear Chat"):
-                st.session_state.chat_messages = []
-                st.session_state.chat_manager.memory.clear()
+                st.session_state.chat_manager.clear_history()
                 st.rerun()
         
-        with col_c2:
-            if st.button("🔄 Reset Session"):
-                st.session_state.pdf_processed = False
-                st.session_state.chat_messages = []
-                st.session_state.pdf_text = ""
-                st.session_state.current_pdf_name = None
-                st.session_state.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with col2:
+            if st.button("🔄 Reset All"):
+                st.session_state.embedding_manager.clear()
+                st.session_state.chat_manager.clear_history()
+                st.session_state.processed_pdfs = {}
                 st.rerun()
         
-        with col_c3:
-            if st.button("💾 Export Chat"):
-                export_text = export_chat_history(st.session_state.chat_messages)
-                st.download_button(
-                    label="Download Chat History",
-                    data=export_text,
-                    file_name=f"chat_history_{st.session_state.session_id}.txt",
-                    mime="text/plain"
-                )
+        # Export chat
+        if st.session_state.chat_manager.history:
+            export_chat_history()
+        
+        st.divider()
+        
+        # Statistics
+        if st.session_state.processed_pdfs:
+            st.subheader("📊 Statistics")
+            total_pages = sum(meta['num_pages'] for meta in st.session_state.processed_pdfs.values())
+            st.metric("Total Pages", total_pages)
+            st.metric("Total Chunks", len(st.session_state.embedding_manager.chunks))
+            st.metric("Chat Messages", len(st.session_state.chat_manager.history))
     
+    # Main chat interface
+    st.header("💬 Chat Interface")
+    
+    # Display chat history
+    chat_container = st.container()
+    
+    with chat_container:
+        if not st.session_state.chat_manager.history:
+            st.info("👋 Upload PDFs and start asking questions!")
+        else:
+            for message in st.session_state.chat_manager.history:
+                if message['role'] == 'user':
+                    with st.chat_message("user"):
+                        st.write(message['content'])
+                else:
+                    with st.chat_message("assistant"):
+                        st.markdown(message['content'])
+    
+    # Query input
+    if st.session_state.processed_pdfs:
+        query = st.chat_input("Ask a question about your PDFs...")
+        
+        if query:
+            # Display user message
+            with st.chat_message("user"):
+                st.write(query)
+            
+            # Store user message
+            st.session_state.chat_manager.add_message('user', query)
+            
+            # Generate and display response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    response = handle_query(query, query_type, top_k_results)
+                    st.markdown(response)
+            
+            # Rerun to update chat display
+            st.rerun()
     else:
-        st.info("
+        st.warning("⚠️ Please upload and process PDFs first!")
+    
+    # Footer
+    st.divider()
+    st.markdown(
+        """
+        <div style='text-align: center; color: gray; padding: 20px;'>
+        <small>Chat with PDF - Powered by Open Source AI | Running 100% Locally</small>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+if __name__ == "__main__":
+    main()
